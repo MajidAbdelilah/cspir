@@ -33,7 +33,7 @@ namespace cspir {
 
             bool VisitBinaryOperator(clang::BinaryOperator *BO) {
                 if (BO->getOpcode() == clang::BO_Assign) {
-                    if (auto *ASE = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+                    if (llvm::isa<clang::ArraySubscriptExpr>(
                             BO->getLHS()->IgnoreParenImpCasts())) {
                         // Check RHS for simple operation
                         if (auto *BinOp = llvm::dyn_cast<clang::BinaryOperator>(
@@ -49,7 +49,6 @@ namespace cspir {
 
         private:
             bool isSimpleOperation(clang::BinaryOperator *BO) {
-                // No change to existing isSimpleOperation
                 if (BO->isMultiplicativeOp() || BO->isAdditiveOp()) {
                     auto *LHS = BO->getLHS()->IgnoreParenImpCasts();
                     auto *RHS = BO->getRHS()->IgnoreParenImpCasts();
@@ -73,7 +72,6 @@ namespace cspir {
 
         PatternMatcher Matcher;
         Matcher.TraverseStmt(FS->getBody());
-        // Only return true if we found a simple pattern and there are no dependencies
         return Matcher.IsSimplePattern && !Matcher.HasDependency;
     }
 
@@ -114,6 +112,7 @@ namespace cspir {
                         Reasons.push_back("Mixed computation types detected in loop");
                     }
                 }
+
                 return true;
             }
 

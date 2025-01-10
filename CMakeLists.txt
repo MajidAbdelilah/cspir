@@ -33,14 +33,19 @@ add_executable(cspir
 # Find Clang libraries
 find_library(CLANG_TOOLING_LIB clang-cpp REQUIRED)
 
-# Add compiler flags
+# Add compiler and linker flags for Address Sanitizer
+set(SANITIZER_FLAGS "-fsanitize=address -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SANITIZER_FLAGS}")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${SANITIZER_FLAGS}")
+
+# Update your target_compile_options
 target_compile_options(cspir PRIVATE
     -fexceptions
     -frtti
     -Wall
     -Wextra
+    -g
 )
-
 # Link against the main Clang library
 target_link_libraries(cspir PRIVATE
     ${CLANG_TOOLING_LIB}
