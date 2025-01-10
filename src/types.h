@@ -17,6 +17,9 @@ struct VectorizationInfo {
     std::vector<std::string> Reasons;
     unsigned RecommendedWidth;
     bool IsReduction;
+    bool IsSimplePattern;
+    bool HasConstantTripCount;
+    uint64_t TripCount;
 };
 
 struct KernelInfo {
@@ -25,6 +28,9 @@ struct KernelInfo {
     bool IsReduction;
     std::vector<std::string> Arguments;
     clang::ForStmt* OriginalLoop;
+    size_t PreferredWorkGroupSize;
+    size_t MaxWorkGroupSize;
+    bool UsesLocalMemory;
 };
 
 } // namespace cspir

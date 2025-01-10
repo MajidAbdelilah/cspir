@@ -5,49 +5,128 @@
 #include "clang/Tooling/CommonOptionsParser.h"
 
 namespace cspir {
+
+    bool LoopAnalyzer::isSimpleVectorizablePattern(clang::ForStmt *FS) {
+        class PatternMatcher : public clang::RecursiveASTVisitor<PatternMatcher> {
+        public:
+            bool IsSimplePattern = false;
+            bool HasDependency = false;
+
+            bool VisitArraySubscriptExpr(clang::ArraySubscriptExpr *ASE) {
+                // Check for array index expressions
+                if (auto *Idx = ASE->getIdx()->IgnoreParenImpCasts()) {
+                    // Check for array[i-1] pattern
+                    if (auto *BO = llvm::dyn_cast<clang::BinaryOperator>(Idx)) {
+                        if (BO->getOpcode() == clang::BO_Sub) {
+                            // If we find a subtraction in the index, it might be a dependency
+                            if (auto *RHS = llvm::dyn_cast<clang::IntegerLiteral>(
+                                    BO->getRHS()->IgnoreParenImpCasts())) {
+                                if (RHS->getValue().getLimitedValue() == 1) {
+                                    HasDependency = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+
+            bool VisitBinaryOperator(clang::BinaryOperator *BO) {
+                if (BO->getOpcode() == clang::BO_Assign) {
+                    if (auto *ASE = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+                            BO->getLHS()->IgnoreParenImpCasts())) {
+                        // Check RHS for simple operation
+                        if (auto *BinOp = llvm::dyn_cast<clang::BinaryOperator>(
+                                BO->getRHS()->IgnoreParenImpCasts())) {
+                            if (isSimpleOperation(BinOp) && !HasDependency) {
+                                IsSimplePattern = true;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+
+        private:
+            bool isSimpleOperation(clang::BinaryOperator *BO) {
+                // No change to existing isSimpleOperation
+                if (BO->isMultiplicativeOp() || BO->isAdditiveOp()) {
+                    auto *LHS = BO->getLHS()->IgnoreParenImpCasts();
+                    auto *RHS = BO->getRHS()->IgnoreParenImpCasts();
+
+                    bool HasArrayAccess = false;
+                    bool HasConstant = false;
+
+                    if (llvm::isa<clang::ArraySubscriptExpr>(LHS)) {
+                        HasArrayAccess = true;
+                    }
+                    if (llvm::isa<clang::FloatingLiteral>(RHS) ||
+                        llvm::isa<clang::IntegerLiteral>(RHS)) {
+                        HasConstant = true;
+                    }
+
+                    return HasArrayAccess && HasConstant;
+                }
+                return false;
+            }
+        };
+
+        PatternMatcher Matcher;
+        Matcher.TraverseStmt(FS->getBody());
+        // Only return true if we found a simple pattern and there are no dependencies
+        return Matcher.IsSimplePattern && !Matcher.HasDependency;
+    }
+
     bool LoopAnalyzer::checkTypes(clang::Stmt *Body, VectorizationInfo &Info) {
         class TypeChecker : public clang::RecursiveASTVisitor<TypeChecker> {
         public:
             bool HasMixedTypes = false;
             std::vector<std::string> &Reasons;
-            llvm::SmallSet<clang::QualType, 4> Types;
+            llvm::SmallSet<clang::QualType, 4> ComputationTypes;
+            llvm::SmallSet<clang::QualType, 4> IndexTypes;
 
             explicit TypeChecker(std::vector<std::string> &R) : Reasons(R) {}
 
             bool VisitExpr(clang::Expr *E) {
                 auto Type = E->getType();
                 if (!Type.isNull()) {
-                    // Only check array element types and computation types
-                    // Ignore loop counters and array indices
                     if (auto *ASE = llvm::dyn_cast<clang::ArraySubscriptExpr>(E)) {
+                        // Array element type
                         Type = ASE->getType();
                         if (Type->isFloatingType() || Type->isIntegerType()) {
-                            Types.insert(Type);
+                            ComputationTypes.insert(Type);
                         }
+                        // Index type should be ignored for mixed type check
+                        IndexTypes.insert(ASE->getIdx()->getType());
                     } else if (auto *BO = llvm::dyn_cast<clang::BinaryOperator>(E)) {
-                        // Only check computation operations, not comparisons or increments
-                        if (BO->getOpcode() == clang::BO_Mul ||
-                            BO->getOpcode() == clang::BO_Div ||
-                            BO->getOpcode() == clang::BO_Add ||
-                            BO->getOpcode() == clang::BO_Sub ||
-                            BO->getOpcode() == clang::BO_AddAssign ||
-                            BO->getOpcode() == clang::BO_SubAssign ||
-                            BO->getOpcode() == clang::BO_MulAssign ||
-                            BO->getOpcode() == clang::BO_DivAssign) {
-
+                        if (isComputationOp(BO)) {
                             Type = BO->getType();
                             if (Type->isFloatingType() || Type->isIntegerType()) {
-                                Types.insert(Type);
+                                if (!IndexTypes.count(Type)) {  // Ignore index types
+                                    ComputationTypes.insert(Type);
+                                }
                             }
                         }
                     }
 
-                    if (Types.size() > 1) {
+                    if (ComputationTypes.size() > 1) {
                         HasMixedTypes = true;
                         Reasons.push_back("Mixed computation types detected in loop");
                     }
                 }
                 return true;
+            }
+
+        private:
+            bool isComputationOp(clang::BinaryOperator *BO) {
+                return BO->getOpcode() == clang::BO_Mul ||
+                       BO->getOpcode() == clang::BO_Div ||
+                       BO->getOpcode() == clang::BO_Add ||
+                       BO->getOpcode() == clang::BO_Sub ||
+                       BO->getOpcode() == clang::BO_AddAssign ||
+                       BO->getOpcode() == clang::BO_SubAssign ||
+                       BO->getOpcode() == clang::BO_MulAssign ||
+                       BO->getOpcode() == clang::BO_DivAssign;
             }
         };
 
@@ -90,96 +169,86 @@ namespace cspir {
             .IsVectorizable = false,
             .Reasons = {},
             .RecommendedWidth = 0,
-            .IsReduction = false
+            .IsReduction = false,
+            .IsSimplePattern = false,
+            .HasConstantTripCount = false,
+            .TripCount = 0
         };
 
-        // Check trip count first
-        bool HasConstantTripCount = false;
-        uint64_t TripCount = 0;
-        if (auto *Cond = llvm::dyn_cast<clang::BinaryOperator>(FS->getCond())) {
-            if (auto *RHS = llvm::dyn_cast<clang::IntegerLiteral>(Cond->getRHS())) {
-                TripCount = RHS->getValue().getLimitedValue();
-                HasConstantTripCount = true;
-                Info.Reasons.push_back("Loop trip count: " + std::to_string(TripCount));
-            } else {
-                // Check if the variable is used only for loop control
-                if (auto *LHS = llvm::dyn_cast<clang::DeclRefExpr>(Cond->getLHS())) {
-                    bool OnlyLoopControl = true;
-                    // Add logic to check if the variable is only used for loop control
-                    if (OnlyLoopControl) {
-                        Info.Reasons.push_back("Loop control variable with predictable access pattern");
-                        HasConstantTripCount = true;
-                    }
-                }
-            }
-        }
+        // First check for dependencies
+        class DependencyChecker : public clang::RecursiveASTVisitor<DependencyChecker> {
+        public:
+            bool HasDependencies = false;
+            std::vector<std::string>& Reasons;
 
-        // Check for reduction pattern
-        bool IsReduction = isReductionLoop(FS, Info);
-        Info.IsReduction = IsReduction;
+            explicit DependencyChecker(std::vector<std::string>& R) : Reasons(R) {}
 
-        // Check memory access patterns
-        bool HasDependencies = false;
-        {
-            class AccessAnalyzer : public clang::RecursiveASTVisitor<AccessAnalyzer> {
-            public:
-                bool HasDependencies = false;
-                std::vector<std::string> &Reasons;
-
-                explicit AccessAnalyzer(std::vector<std::string> &R) : Reasons(R) {}
-
-                bool VisitArraySubscriptExpr(clang::ArraySubscriptExpr *ASE) {
-                    if (auto *Idx = ASE->getIdx()) {
-                        if (auto *BO = llvm::dyn_cast<clang::BinaryOperator>(Idx)) {
-                            // Only flag as dependency if it's not a simple increment
-                            if (!isSimpleIncrement(BO)) {
-                                HasDependencies = true;
-                                Reasons.push_back("Non-uniform array access detected: possible dependency");
+            bool VisitArraySubscriptExpr(clang::ArraySubscriptExpr *ASE) {
+                if (auto *Idx = ASE->getIdx()->IgnoreParenImpCasts()) {
+                    if (auto *BO = llvm::dyn_cast<clang::BinaryOperator>(Idx)) {
+                        if (BO->getOpcode() == clang::BO_Sub) {
+                            if (auto *RHS = llvm::dyn_cast<clang::IntegerLiteral>(
+                                    BO->getRHS()->IgnoreParenImpCasts())) {
+                                if (RHS->getValue().getLimitedValue() == 1) {
+                                    HasDependencies = true;
+                                    Reasons.push_back("Loop-carried dependency detected: array[i-1] access pattern");
+                                }
                             }
                         }
                     }
-                    return true;
                 }
+                return true;
+            }
+        };
 
-            private:
-                bool isSimpleIncrement(clang::BinaryOperator *BO) {
-                    // Add logic to detect simple increment patterns
-                    return false;
-                }
-            };
+        DependencyChecker DepChecker(Info.Reasons);
+        DepChecker.TraverseStmt(FS->getBody());
+        bool HasDependencies = DepChecker.HasDependencies;
 
-            AccessAnalyzer Analyzer(Info.Reasons);
-            Analyzer.TraverseStmt(FS->getBody());
-            HasDependencies = Analyzer.HasDependencies;
+        // Rest of your existing analysis...
+        // Check trip count
+        if (auto *Cond = llvm::dyn_cast<clang::BinaryOperator>(FS->getCond())) {
+            if (auto *RHS = llvm::dyn_cast<clang::IntegerLiteral>(Cond->getRHS())) {
+                Info.TripCount = RHS->getValue().getLimitedValue();
+                Info.HasConstantTripCount = true;
+                Info.Reasons.push_back("Loop trip count: " + std::to_string(Info.TripCount));
+            }
         }
 
-        // Check types
-        bool UniformTypes = checkTypes(FS->getBody(), Info);
+        // Check if it's a simple pattern
+        Info.IsSimplePattern = isSimpleVectorizablePattern(FS);
+        if (Info.IsSimplePattern) {
+            Info.Reasons.push_back("Simple vectorizable pattern detected");
+        }
+
+        // Check for reduction pattern
+        Info.IsReduction = isReductionLoop(FS, Info);
 
         // Make vectorization decision
-        Info.IsVectorizable = (HasConstantTripCount || IsReduction) &&
-                             (!HasDependencies || IsReduction) &&
-                             (UniformTypes || IsReduction);
+        Info.IsVectorizable = (Info.HasConstantTripCount || Info.IsReduction || Info.IsSimplePattern) &&
+                             (!HasDependencies || Info.IsReduction) &&  // Changed this line
+                             checkTypes(FS->getBody(), Info);
 
         if (Info.IsVectorizable) {
-            if (IsReduction) {
-                Info.Reasons.push_back("Vectorizable reduction pattern");
+            if (Info.IsReduction) {
                 Info.RecommendedWidth = 4;
-            } else if (HasConstantTripCount && TripCount >= 8) {
+            } else if (Info.HasConstantTripCount && Info.TripCount >= 8) {
                 Info.RecommendedWidth = 8;
-                Info.Reasons.push_back("Loop suitable for AVX vectorization");
             } else {
                 Info.RecommendedWidth = 4;
-                Info.Reasons.push_back("Loop suitable for SSE vectorization");
             }
+        } else if (HasDependencies) {  // Add this condition
+            Info.Reasons.push_back("Loop cannot be vectorized due to dependencies");
         }
 
         return Info;
     }
 
+
     bool LoopAnalyzer::isVectorizable(clang::ForStmt *FS) {
         auto Info = analyzeWithOptimizer(FS);
 
+        // Print basic analysis header
         llvm::outs() << "\nLLVM Vectorization Analysis:\n";
         llvm::outs() << "-------------------------\n";
 
@@ -194,10 +263,16 @@ namespace cspir {
         }
 
         if (Info.IsVectorizable) {
-            llvm::outs() << "\nVectorization Details:\n";
+            // Print detailed analysis for vectorizable loops
+            llvm::outs() << "\nVectorization Analysis Details:\n";
+            llvm::outs() << "- Pattern: "
+                         << (Info.IsReduction ? "Reduction" :
+                            Info.IsSimplePattern ? "Simple arithmetic" : "General parallel") << "\n";
             llvm::outs() << "- Vector width: " << Info.RecommendedWidth << "\n";
-            llvm::outs() << "- Operation type: " << (Info.IsReduction ? "Reduction" : "Parallel") << "\n";
+            llvm::outs() << "- Trip count: "
+                         << (Info.HasConstantTripCount ? std::to_string(Info.TripCount) : "Variable") << "\n";
 
+            // Add kernel generation
             SPIRVGenerator Generator(Context);
             if (Generator.generateKernel(FS, Info)) {
                 llvm::outs() << "\nGenerated SPIR-V kernel:\n";
@@ -212,7 +287,6 @@ namespace cspir {
 
         return Info.IsVectorizable;
     }
-
 
     bool C89ASTVisitor::VisitRecordDecl(clang::RecordDecl *RD) {
         llvm::outs() << "\nRecord Declaration: (";

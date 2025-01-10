@@ -16,6 +16,7 @@ void SPIRVGenerator::initializeModule() {
 
 
 
+
 bool SPIRVGenerator::generateKernel(clang::ForStmt* Loop,
                                   const VectorizationInfo& Info) {
     if (!Module) {
@@ -103,7 +104,6 @@ bool SPIRVGenerator::generateVectorizedLoop(const KernelInfo& KInfo) {
     // Load vector
     auto* Input = Func->arg_begin();
     auto* FloatTy = llvm::Type::getFloatTy(Builder.getContext());
-    auto* PtrTy = llvm::PointerType::get(FloatTy, 0);
 
     // Create GEP instruction correctly
     auto* VecPtr = Builder.CreateInBoundsGEP(
@@ -123,12 +123,53 @@ bool SPIRVGenerator::generateVectorizedLoop(const KernelInfo& KInfo) {
     // Load the vector
     auto* Vec = Builder.CreateLoad(VecTy, CastPtr);
 
-    // Perform vector operation (example: multiply by 2)
-    auto* Two = llvm::ConstantVector::getSplat(
-        llvm::ElementCount::getFixed(KInfo.VectorWidth),
-        llvm::ConstantFP::get(Builder.getContext(), llvm::APFloat(2.0f))
-    );
-    auto* Result = Builder.CreateFMul(Vec, Two);
+    // Analyze the operation type
+        class OperationAnalyzer : public clang::RecursiveASTVisitor<OperationAnalyzer> {
+        public:
+            clang::BinaryOperator::Opcode OpCode = clang::BO_Comma; // Invalid default
+            llvm::APFloat Constant = llvm::APFloat(0.0f);
+            bool HasOperation = false;
+
+            bool VisitBinaryOperator(clang::BinaryOperator *BO) {
+                if (BO->isAssignmentOp()) {
+                    if (auto *RHS = llvm::dyn_cast<clang::BinaryOperator>(
+                            BO->getRHS()->IgnoreParenImpCasts())) {
+                        OpCode = RHS->getOpcode();
+                        if (auto *FL = llvm::dyn_cast<clang::FloatingLiteral>(
+                                RHS->getRHS()->IgnoreParenImpCasts())) {
+                            Constant = FL->getValue();
+                            HasOperation = true;
+                        }
+                    }
+                }
+                return true;
+            }
+        };
+
+        OperationAnalyzer OpAnalyzer;
+        OpAnalyzer.TraverseStmt(KInfo.OriginalLoop->getBody());
+
+        // Generate appropriate vector operation
+        llvm::Value* Result;
+        if (OpAnalyzer.HasOperation) {
+            auto* Constant = llvm::ConstantVector::getSplat(
+                llvm::ElementCount::getFixed(KInfo.VectorWidth),
+                llvm::ConstantFP::get(Builder.getContext(), OpAnalyzer.Constant)
+            );
+
+            switch (OpAnalyzer.OpCode) {
+                case clang::BO_Add:
+                    Result = Builder.CreateFAdd(Vec, Constant);
+                    break;
+                case clang::BO_Mul:
+                    Result = Builder.CreateFMul(Vec, Constant);
+                    break;
+                default:
+                    Result = Vec; // Default to identity operation
+            }
+        } else {
+            Result = Vec;
+        }
 
     // Store result
     auto* Output = std::next(Func->arg_begin());
@@ -147,12 +188,85 @@ bool SPIRVGenerator::generateVectorizedLoop(const KernelInfo& KInfo) {
     return !llvm::verifyFunction(*Func, &llvm::errs());
 }
 
+
+
 bool SPIRVGenerator::generateReductionKernel(const KernelInfo& KInfo) {
-    // TODO: Implement reduction-specific logic
-    llvm::errs() << "Reduction kernel generation not yet implemented for: "
-                 << KInfo.Name << "\n";
-    return false;
+    // Create kernel function type
+    std::vector<llvm::Type*> ArgTypes;
+    auto* FloatTy = llvm::Type::getFloatTy(Builder.getContext());
+
+    // Input array
+    ArgTypes.push_back(llvm::PointerType::get(FloatTy, 0));
+    // Result buffer
+    ArgTypes.push_back(llvm::PointerType::get(FloatTy, 0));
+    // Global size
+    ArgTypes.push_back(llvm::Type::getInt32Ty(Builder.getContext()));
+
+    auto* FuncTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(Builder.getContext()),
+        ArgTypes,
+        false
+    );
+
+    auto* Func = llvm::Function::Create(
+        FuncTy,
+        llvm::Function::ExternalLinkage,
+        KInfo.Name,
+        Module.get()
+    );
+
+    // Add attributes
+    Func->addFnAttr("opencl.kernels", KInfo.Name);
+
+    // Create blocks
+    auto* Entry = llvm::BasicBlock::Create(Builder.getContext(), "entry", Func);
+    Builder.SetInsertPoint(Entry);
+
+    // Get global ID and size
+    auto* GlobalId = Builder.CreateCall(
+        Module->getOrInsertFunction(
+            "get_global_id",
+            llvm::Type::getInt32Ty(Builder.getContext()),
+            llvm::Type::getInt32Ty(Builder.getContext())
+        ),
+        {llvm::ConstantInt::get(Builder.getContext(), llvm::APInt(32, 0))}
+    );
+
+    // Load input value
+    auto* Input = Func->arg_begin();
+    auto* LoadPtr = Builder.CreateInBoundsGEP(FloatTy, Input, {GlobalId});
+    auto* Val = Builder.CreateLoad(FloatTy, LoadPtr);
+
+    // Create atomic add to result
+    auto* Result = std::next(Func->arg_begin());
+    auto* LocalMem = Builder.CreateAlloca(
+            llvm::ArrayType::get(FloatTy, KInfo.VectorWidth),
+            nullptr,
+            "local_mem"
+        );
+
+        // Load vector
+        auto* Vec = createVectorLoad(Input, KInfo.VectorWidth);
+
+        // Perform vector reduction
+        auto* Sum = Builder.CreateExtractElement(Vec, (uint64_t)0);
+        for (unsigned i = 1; i < KInfo.VectorWidth; ++i) {
+            auto* Elem = Builder.CreateExtractElement(Vec, i);
+            Sum = Builder.CreateFAdd(Sum, Elem);
+        }
+
+        // Atomic add to global result
+        Builder.CreateAtomicRMW(
+            llvm::AtomicRMWInst::FAdd,
+            Result,
+            Sum,
+            llvm::MaybeAlign(4),
+            llvm::AtomicOrdering::SequentiallyConsistent
+        );
+
+    return true;
 }
+
 
 
 std::string SPIRVGenerator::getKernelName(clang::ForStmt* Loop) {

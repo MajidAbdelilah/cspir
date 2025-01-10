@@ -37,6 +37,7 @@ namespace cspir {
         bool analyzeCFG(clang::ForStmt *FS, VectorizationInfo &Info);
         bool isReductionLoop(clang::ForStmt *FS, VectorizationInfo &Info);
         bool checkTypes(clang::Stmt *Body, VectorizationInfo &Info);
+        bool isSimpleVectorizablePattern(clang::ForStmt *FS);  // Add this declaration
 
         clang::ASTContext *Context;
         clang::DiagnosticsEngine &Diags;

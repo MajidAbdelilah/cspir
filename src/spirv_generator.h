@@ -23,6 +23,8 @@ public:
     bool generateKernel(clang::ForStmt* Loop, const VectorizationInfo& Info);
     llvm::Module* getModule() { return Module.get(); }
 
+
+
 private:
     bool generateVectorizedLoop(const KernelInfo& KInfo);
     bool generateReductionKernel(const KernelInfo& KInfo);
